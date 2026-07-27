@@ -74,7 +74,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         "enabled": True,
         "provider": "github-raw",
         # TODO: 실제 배포 리포지토리 경로로 교체하십시오.
-        "raw_base_url": "https://raw.githubusercontent.com/yume-script/extract_isbn/refs/heads/main/",
+        "raw_base_url": "https://raw.githubusercontent.com/<org>/<repo>/refs/heads/main/plugins/metadata/extract_isbn",
         "files": ["extract_isbn.py", "utils_extract_isbn.py", "__init__.py", "VERSION"],
         "version_file": "VERSION",
         "version_key": "plugin version",
