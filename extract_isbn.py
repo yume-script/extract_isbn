@@ -74,7 +74,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         "enabled": True,
         "provider": "github-raw",
         # TODO: 실제 배포 리포지토리 경로로 교체하십시오.
-        "raw_base_url": "https://raw.githubusercontent.com/yume-script/extract_isbn/refs/heads/main/",
+        "raw_base_url": "https://raw.githubusercontent.com/<org>/<repo>/refs/heads/main/plugins/metadata/extract_isbn",
         "files": ["extract_isbn.py", "utils_extract_isbn.py", "__init__.py", "VERSION"],
         "version_file": "VERSION",
         "version_key": "plugin version",
@@ -88,7 +88,10 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
     ]
 
     def _find_book(self, gateway, query):
-        """검색창에 입력된 텍스트(보통 도서 제목)로 books 테이블에서 대상 도서를 추적."""
+        """검색창에 입력된 텍스트(보통 도서 제목)로 books 테이블에서 대상 도서를 추적.
+        title/author/publisher도 함께 가져와, 검색 결과 카드에 실제 값을 그대로 보여주고
+        (제목/저자/출판사를 임의 문자열로 바꾸지 않기 위함) 적용 확인창에서의 혼동을 줄인다.
+        """
         clean_query_base = re.sub(r'\.(epub|pdf|txt)$', '', query or '', flags=re.IGNORECASE)
         clean_query_base = re.sub(r'\[.*?\]|\(.*?\)', '', clean_query_base).strip()
         if not clean_query_base:
@@ -96,10 +99,11 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         if not clean_query_base:
             return None
 
-        book = gateway.fetch_one("SELECT file_path FROM books WHERE title = ? LIMIT 1", (clean_query_base,))
+        select_cols = "file_path, title, author, publisher"
+        book = gateway.fetch_one(f"SELECT {select_cols} FROM books WHERE title = ? LIMIT 1", (clean_query_base,))
         if not book:
             book = gateway.fetch_one(
-                "SELECT file_path FROM books WHERE file_path LIKE ? LIMIT 1",
+                f"SELECT {select_cols} FROM books WHERE file_path LIKE ? LIMIT 1",
                 (f"%{clean_query_base}%",)
             )
         if not book:
@@ -107,7 +111,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
             if len(words) >= 2:
                 sub_query = " ".join(words[:2])
                 book = gateway.fetch_one(
-                    "SELECT file_path FROM books WHERE title LIKE ? LIMIT 1",
+                    f"SELECT {select_cols} FROM books WHERE title LIKE ? LIMIT 1",
                     (f"%{sub_query}%",)
                 )
         return book
@@ -162,11 +166,17 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
             return [_fail_item('❌ 유효하지 않은 ISBN', f'추출된 값이 체크디지트 검증을 통과하지 못했습니다: {clean_isbn}')]
 
         method_label = _METHOD_LABEL.get(method, method or '알 수 없음')
+        real_title = get_row_val(book, 'title') or query
+        real_author = get_row_val(book, 'author')
+        real_publisher = get_row_val(book, 'publisher')
         return [{
-            'title': f'✅ ISBN 추출 성공: {clean_isbn}',
-            'author': '',
-            'publisher': '',
-            'summary': f'감지 방식: {method_label}. 이 결과를 적용하면 도서의 ISBN 항목에 저장됩니다.',
+            'title': real_title,
+            'author': real_author,
+            'publisher': real_publisher,
+            'summary': (
+                f'✅ ISBN 추출 성공: {clean_isbn}  (감지 방식: {method_label})\n'
+                f'※ 이 항목을 적용해도 제목/저자/출판사/표지/설명은 변경되지 않으며, ISBN만 갱신됩니다.'
+            ),
             'isbn': clean_isbn,
             'cover': '',
             'pubDate': '',
