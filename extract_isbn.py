@@ -151,6 +151,8 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
                 gemini_key=gemini_key or None,
                 llm_endpoint=llm_endpoint or None,
                 llm_model=llm_model or None,
+                book_title=get_row_val(book, 'title') or None,
+                file_name=os.path.basename(file_path),
             )
         except Exception as e:
             return [_fail_item('❌ 추출 중 오류 발생', str(e))]

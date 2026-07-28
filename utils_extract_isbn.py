@@ -26,8 +26,12 @@ ISBN_PATTERN = re.compile(
     r'\b(?:97[89][-\s.]?)?\d{1,5}[-\s.]?\d{1,7}[-\s.]?\d{1,6}[-\s.]?[\dX]\b'
 )
 
+# 로컬 스캔 시 앞/뒤로 살펴볼 구간 수. 값을 줄이면 I/O와 LLM 프롬프트 크기가 함께 줄어들어
+# 더 효율적으로 동작하지만, 판권지가 이 범위 밖에 있으면 놓칠 수 있으니 필요시 조정하십시오.
+EPUB_SCAN_SECTIONS = 5   # 앞 N개 + 뒤 N개 spine(챕터) 파일
+PDF_SCAN_PAGES = 5       # 앞 N페이지 + 뒤 N페이지
 # TXT 앞/뒤에서 각각 읽어들일 바이트 수 (판권지가 파일 앞쪽/뒤쪽 어디에 있어도 대응)
-TXT_SCAN_BYTES = 20000
+TXT_SCAN_BYTES = 8000
 # LLM 프롬프트에 실어보낼 최대 문자 수
 LLM_TEXT_LIMIT = 12000
 
@@ -71,17 +75,36 @@ def validate_isbn10(isbn):
         return False
 
 
-def extract_isbn_via_llm(text, api_key, endpoint=None, model=None):
-    """구글 Gemini API 및 LiteLLM(OpenAI 호환) 프록시를 모두 지원하는 통합 지능형 판독 엔진"""
+def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=None, file_name=None):
+    """구글 Gemini API 및 LiteLLM(OpenAI 호환) 프록시를 모두 지원하는 통합 지능형 판독 엔진.
+
+    book_title/file_name은 어디까지나 '참고용 힌트'이며, 실제 ISBN은 반드시 text 안에
+    실존하는 문자열에서만 추출하도록 프롬프트에 강하게 못박아 둔다. 이렇게 하지 않으면
+    모델이 본문에서 못 찾았을 때 자기 사전지식으로 '그럴듯한' ISBN을 추측해 답할 위험이 있고,
+    그런 값은 체크디지트 검증은 통과하지만 실제로는 틀린 값일 수 있다.
+    """
     if not text or not text.strip():
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={api_key}"
 
+    ref_lines = []
+    if book_title:
+        ref_lines.append(f"- 도서 제목(참고용 힌트, 본문 검색에만 활용): {book_title}")
+    if file_name:
+        ref_lines.append(f"- 파일명(참고용 힌트, 본문 검색에만 활용): {file_name}")
+    ref_block = ("[참고 정보]\n" + "\n".join(ref_lines) + "\n\n") if ref_lines else ""
+
     prompt = (
         "다음 도서 판권지/본문 텍스트에서 ISBN 번호만 추출해줘.\n"
+        f"{ref_block}"
+        "중요 규칙(반드시 지킬 것):\n"
+        "1) 참고 정보(제목/파일명)는 아래 [텍스트 본문]에서 ISBN을 더 잘 찾기 위한 힌트일 뿐이다.\n"
+        "2) 절대로 너의 사전 지식이나 추측으로 ISBN을 만들어내면 안 된다. 오직 [텍스트 본문]에 "
+        "실제로 등장하는 숫자 조합만 답으로 사용해야 한다.\n"
+        "3) [텍스트 본문] 안에서 유효한 ISBN을 찾지 못했다면, 절대 추측하지 말고 빈 문자열을 반환하라.\n"
         "출력은 반드시 다른 미사여구 없이 JSON 형식으로만 해야 하며, 그 구조는 반드시 다음 스키마를 따라야 해:\n"
-        "{\"isbn\": \"공백이나 하이픈을 제거한 오직 10자리 또는 13자리 숫자(마지막 X 허용) 문자열 (발견되지 않으면 빈 문자열)\"}\n\n"
+        "{\"isbn\": \"공백이나 하이픈을 제거한 오직 10자리 또는 13자리 숫자(마지막 X 허용) 문자열 (본문에서 발견되지 않으면 반드시 빈 문자열)\"}\n\n"
         f"[텍스트 본문]\n{text}"
     )
 
@@ -173,7 +196,8 @@ def _scan_text_for_isbn(text_content):
     return None, isbn10_candidates
 
 
-def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_model=None):
+def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_model=None,
+                            book_title=None, file_name=None):
     """EPUB 내부 컨테이너 구조 및 본문 파일 분석 후 ISBN 추출 (지능형 LLM 듀얼 분기 가동)"""
     try:
         with zipfile.ZipFile(epub_path, 'r') as epub:
@@ -197,7 +221,7 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
                     if validate_isbn13(clean) or validate_isbn10(clean):
                         return clean, "LOCAL"
 
-            # 2단계 백업: 본문 XHTML 파일 분석 (앞쪽 8장 + 뒤쪽 8장 대역 확장 분석)
+            # 2단계 백업: 본문 XHTML 파일 분석 (앞쪽 N장 + 뒤쪽 N장 대역 확장 분석)
             manifest = {}
             for elem in opf_root.iter():
                 if elem.tag.endswith('item'):
@@ -214,9 +238,10 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
                         spine_item_ids.append(idref)
 
             num_spines = len(spine_item_ids)
-            target_spines = list(range(min(8, num_spines)))
-            if num_spines > 8:
-                target_spines.extend(list(range(max(8, num_spines - 8), num_spines)))
+            n = EPUB_SCAN_SECTIONS
+            target_spines = list(range(min(n, num_spines)))
+            if num_spines > n:
+                target_spines.extend(list(range(max(n, num_spines - n), num_spines)))
             target_spines = sorted(list(set(target_spines)))
 
             opf_dir = os.path.dirname(opf_path)
@@ -271,7 +296,10 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
 
             if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
                 full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-                llm_isbn = extract_isbn_via_llm(full_text, gemini_key, endpoint=llm_endpoint, model=llm_model)
+                llm_isbn = extract_isbn_via_llm(
+                    full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
+                    book_title=book_title, file_name=file_name,
+                )
                 if llm_isbn:
                     return llm_isbn, "AI"
 
@@ -280,7 +308,8 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
     return None, None
 
 
-def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_model=None):
+def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_model=None,
+                           book_title=None, file_name=None):
     """PDF 메타데이터 및 전후면 판권 페이지 고속 스캔 (지능형 LLM 듀얼 분기 가동)"""
     if not PYPDF_AVAILABLE:
         return None, None
@@ -309,9 +338,9 @@ def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_mode
             if not sample_text.strip():
                 return None, None  # 전후방 모두 글자가 전혀 긁히지 않는 스캔 도서
 
-            pages_to_scan = list(range(min(30, num_pages)))
-            if num_pages > 30:
-                pages_to_scan.extend(list(range(max(30, num_pages - 30), num_pages)))
+            pages_to_scan = list(range(min(PDF_SCAN_PAGES, num_pages)))
+            if num_pages > PDF_SCAN_PAGES:
+                pages_to_scan.extend(list(range(max(PDF_SCAN_PAGES, num_pages - PDF_SCAN_PAGES), num_pages)))
             pages_to_scan = sorted(list(set(pages_to_scan)))
 
             isbn10_candidates = []
@@ -337,7 +366,10 @@ def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_mode
 
             if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
                 full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-                llm_isbn = extract_isbn_via_llm(full_text, gemini_key, endpoint=llm_endpoint, model=llm_model)
+                llm_isbn = extract_isbn_via_llm(
+                    full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
+                    book_title=book_title, file_name=file_name,
+                )
                 if llm_isbn:
                     return llm_isbn, "AI"
 
@@ -356,7 +388,8 @@ def _decode_bytes(raw, encoding_hints=('utf-8', 'cp949', 'euc-kr')):
     return raw.decode('utf-8', errors='ignore')
 
 
-def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_model=None):
+def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_model=None,
+                           book_title=None, file_name=None):
     """TXT 파일 앞/뒤 구간을 스캔하여 ISBN 추출 (지능형 LLM 듀얼 분기 가동).
     판권지가 파일 맨 앞(표지 다음)이나 맨 뒤(colophon) 어디에 있어도 대응하도록
     파일의 앞쪽 TXT_SCAN_BYTES와 뒤쪽 TXT_SCAN_BYTES만 읽어 대용량 파일에서도 가볍게 동작합니다.
@@ -399,7 +432,10 @@ def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_mode
 
         if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
             full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-            llm_isbn = extract_isbn_via_llm(full_text, gemini_key, endpoint=llm_endpoint, model=llm_model)
+            llm_isbn = extract_isbn_via_llm(
+                full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
+                book_title=book_title, file_name=file_name,
+            )
             if llm_isbn:
                 return llm_isbn, "AI"
 
