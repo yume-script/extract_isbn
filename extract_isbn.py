@@ -58,11 +58,13 @@ def _fail_item(title, summary, log_text=""):
     log_text가 주어지면 실패 사유 뒤에 단계별 로그를 그대로 덧붙여, 실패했을 때도
     어느 단계에서 무슨 일이 있었는지 UI에서 바로 확인할 수 있게 한다.
     """
+    combined_text = f"{summary}{log_text}"
     return {
         'title': title,
         'author': '',
         'publisher': '',
-        'summary': f"{summary}{log_text}",
+        'summary': combined_text,
+        'description': combined_text,  # 코어가 summary 대신 description을 읽는 경우 대비
         'isbn': '',
         'cover': '',
         'pubDate': '',
@@ -238,16 +240,19 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         existing_isbn = re.sub(r'[^0-9X]', '', str(existing_isbn_raw or '').upper())
         if existing_isbn and (validate_isbn13(existing_isbn) or validate_isbn10(existing_isbn)):
             logger.log(f"DB에 이미 유효한 ISBN 저장되어 있음 — 재추출 생략: {existing_isbn}")
+            cached_text = (
+                f'{match_warning}'
+                f'ℹ️ 이미 유효한 ISBN이 저장되어 있어 재추출하지 않았습니다: {existing_isbn}\n'
+                f'다시 추출하려면 이 도서의 ISBN 값을 비운 뒤 재검색하세요.'
+                f'{logger.as_text()}'
+            )
             return [{
-                'title': real_title,
+                # 설명란이 화면에 렌더링되지 않는 경우를 대비해 ISBN을 제목에도 그대로 노출한다.
+                'title': f'[ISBN: {existing_isbn}] {real_title}',
                 'author': real_author,
                 'publisher': real_publisher,
-                'summary': (
-                    f'{match_warning}'
-                    f'ℹ️ 이미 유효한 ISBN이 저장되어 있어 재추출하지 않았습니다: {existing_isbn}\n'
-                    f'다시 추출하려면 이 도서의 ISBN 값을 비운 뒤 재검색하세요.'
-                    f'{logger.as_text()}'
-                ),
+                'summary': cached_text,
+                'description': cached_text,
                 'isbn': existing_isbn,
                 'cover': '',
                 'pubDate': '',
@@ -304,16 +309,19 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         if method == 'LOCAL_WEAK':
             confidence_note = '\n⚠️ 문맥에서 "ISBN" 표기를 확인하지 못했습니다. 값이 우연히 체크디지트를 통과한 다른 숫자열일 수 있으니 적용 전 확인해 주세요.'
 
+        result_text = (
+            f'{match_warning}'
+            f'✅ ISBN 추출 성공: {clean_isbn}  (감지 방식: {method_label}){confidence_note}\n'
+            f'※ 이 항목을 적용해도 제목/저자/출판사/표지/설명은 변경되지 않으며, ISBN만 갱신됩니다.'
+            f'{logger.as_text()}'
+        )
         return [{
-            'title': real_title,
+            # 설명란이 화면에 렌더링되지 않는 경우를 대비해 ISBN을 제목에도 그대로 노출한다.
+            'title': f'[ISBN: {clean_isbn}] {real_title}',
             'author': real_author,
             'publisher': real_publisher,
-            'summary': (
-                f'{match_warning}'
-                f'✅ ISBN 추출 성공: {clean_isbn}  (감지 방식: {method_label}){confidence_note}\n'
-                f'※ 이 항목을 적용해도 제목/저자/출판사/표지/설명은 변경되지 않으며, ISBN만 갱신됩니다.'
-                f'{logger.as_text()}'
-            ),
+            'summary': result_text,
+            'description': result_text,
             'isbn': clean_isbn,
             'cover': '',
             'pubDate': '',
