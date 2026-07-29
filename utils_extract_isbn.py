@@ -26,6 +26,13 @@ ISBN_PATTERN = re.compile(
     r'\b(?:97[89][-\s.]?)?\d{1,5}[-\s.]?\d{1,7}[-\s.]?\d{1,6}[-\s.]?[\dX]\b'
 )
 
+# ISBN-13은 978/979 접두사 + 체크디지트로 이미 상당히 구체적이라 별도 문맥 확인 없이 신뢰합니다.
+# ISBN-10은 접두사가 없어 체크디지트만으로는 우연히 통과하는 임의의 숫자열(전화번호/일련번호 등)과
+# 구분이 어렵습니다(약 1/11 확률로 우연히 통과). 그래서 매치 주변에 "ISBN" 문구가 있는지로
+# 신뢰도를 나눕니다.
+ISBN10_CONTEXT_WINDOW = 30
+ISBN10_CONTEXT_KEYWORDS = ('isbn', 'ｉｓｂｎ')  # 전각 변형 등 필요시 추가
+
 # 로컬 스캔 시 앞/뒤로 살펴볼 구간 수. 값을 줄이면 I/O와 LLM 프롬프트 크기가 함께 줄어들어
 # 더 효율적으로 동작하지만, 판권지가 이 범위 밖에 있으면 놓칠 수 있으니 필요시 조정하십시오.
 EPUB_SCAN_SECTIONS = 5   # 앞 N개 + 뒤 N개 spine(챕터) 파일
@@ -34,6 +41,9 @@ PDF_SCAN_PAGES = 5       # 앞 N페이지 + 뒤 N페이지
 TXT_SCAN_BYTES = 8000
 # LLM 프롬프트에 실어보낼 최대 문자 수
 LLM_TEXT_LIMIT = 12000
+# LLM 호출 기본 타임아웃(초). 플러그인 설정(REQUEST_TIMEOUT_SEC)으로 덮어쓸 수 있습니다.
+DEFAULT_LLM_TIMEOUT_SEC = 15
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 
 def get_row_val(row, key, default=''):
@@ -75,7 +85,8 @@ def validate_isbn10(isbn):
         return False
 
 
-def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=None, file_name=None):
+def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=None, file_name=None,
+                          timeout_sec=None):
     """구글 Gemini API 및 LiteLLM(OpenAI 호환) 프록시를 모두 지원하는 통합 지능형 판독 엔진.
 
     book_title/file_name은 어디까지나 '참고용 힌트'이며, 실제 ISBN은 반드시 text 안에
@@ -86,7 +97,10 @@ def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=No
     if not text or not text.strip():
         return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={api_key}"
+    timeout = timeout_sec if timeout_sec and timeout_sec > 0 else DEFAULT_LLM_TIMEOUT_SEC
+    gemini_model = (model.strip() if (model and model.strip() and not endpoint) else DEFAULT_GEMINI_MODEL)
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
 
     ref_lines = []
     if book_title:
@@ -135,7 +149,7 @@ def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=No
 
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 res_data = json.loads(response.read().decode('utf-8'))
                 choices = res_data.get('choices', [])
                 if choices:
@@ -161,7 +175,7 @@ def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=No
                 data=json.dumps(payload).encode('utf-8'),
                 headers={'Content-Type': 'application/json'}
             )
-            with urllib.request.urlopen(req, timeout=12) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 res_data = json.loads(response.read().decode('utf-8'))
                 candidates = res_data.get('candidates', [])
                 if candidates:
@@ -182,22 +196,85 @@ def extract_isbn_via_llm(text, api_key, endpoint=None, model=None, book_title=No
     return None
 
 
+def _has_isbn_context(text_content, match_start, match_end):
+    """매치된 위치 앞뒤 ISBN10_CONTEXT_WINDOW 글자 안에 'ISBN' 문구가 있는지 확인.
+    있으면 우연히 통과한 임의 숫자열이 아니라 실제 ISBN 표기일 가능성이 높다고 본다.
+    """
+    window_start = max(0, match_start - ISBN10_CONTEXT_WINDOW)
+    window_end = min(len(text_content), match_end + ISBN10_CONTEXT_WINDOW)
+    context = text_content[window_start:window_end].lower()
+    return any(kw in context for kw in ISBN10_CONTEXT_KEYWORDS)
+
+
 def _scan_text_for_isbn(text_content):
     """텍스트 블록 하나에서 ISBN13(우선) 또는 ISBN10 후보를 추출.
-    반환: (isbn13_확정값 또는 None, isbn10_후보_리스트)
+
+    ISBN13은 접두사(978/979)+체크디지트만으로 오탐 가능성이 낮아 즉시 확정 채택한다.
+    ISBN10은 체크디지트만으로는 우연히 통과하는 숫자열(전화번호, 일련번호 등)과 구분이
+    어려우므로, 주변에 'ISBN' 문구가 있는 것(confident)과 없는 것(weak)을 분리해서 반환한다.
+
+    반환: (isbn13_확정값 또는 None, isbn10_confident_리스트, isbn10_weak_리스트)
     """
-    isbn10_candidates = []
-    for match in ISBN_PATTERN.findall(text_content):
-        clean = re.sub(r'[^0-9X]', '', match.upper())
+    isbn10_confident = []
+    isbn10_weak = []
+    for match in ISBN_PATTERN.finditer(text_content):
+        raw = match.group(0)
+        clean = re.sub(r'[^0-9X]', '', raw.upper())
         if validate_isbn13(clean):
-            return clean, isbn10_candidates
+            return clean, isbn10_confident, isbn10_weak
         elif validate_isbn10(clean):
-            isbn10_candidates.append(clean)
-    return None, isbn10_candidates
+            if _has_isbn_context(text_content, match.start(), match.end()):
+                isbn10_confident.append(clean)
+            else:
+                isbn10_weak.append(clean)
+    return None, isbn10_confident, isbn10_weak
+
+
+def _resolve_llm_kwargs(gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name):
+    return {
+        'api_key': gemini_key,
+        'endpoint': llm_endpoint,
+        'model': llm_model,
+        'book_title': book_title,
+        'file_name': file_name,
+        'timeout_sec': timeout_sec,
+    }
+
+
+def _finalize_isbn10(compiled_texts, isbn10_confident, isbn10_weak,
+                      gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name):
+    """앞/뒤 스캔이 끝난 뒤 ISBN10 후보를 최종 판정한다.
+
+    우선순위: 문맥 확인된(confident) 후보 > (AI 사용 가능하면) AI 교차검증 > 문맥 미확인(weak) 후보.
+    즉, weak 후보만 있고 AI를 쓸 수 있는 상황이라면 weak 값을 바로 채택하지 않고 AI로 한 번
+    검증해서 오탐 가능성을 줄인다.
+    """
+    if isbn10_confident:
+        return isbn10_confident[0], "LOCAL"
+
+    ai_available = bool(gemini_key or (llm_endpoint and llm_endpoint.strip()))
+
+    if isbn10_weak and not ai_available:
+        return isbn10_weak[0], "LOCAL_WEAK"
+
+    if compiled_texts and ai_available:
+        full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
+        llm_isbn = extract_isbn_via_llm(
+            full_text,
+            **_resolve_llm_kwargs(gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name),
+        )
+        if llm_isbn:
+            return llm_isbn, "AI"
+
+    if isbn10_weak:
+        # AI를 시도했지만 실패/미설정이었던 경우의 마지막 폴백
+        return isbn10_weak[0], "LOCAL_WEAK"
+
+    return None, None
 
 
 def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_model=None,
-                            book_title=None, file_name=None):
+                            book_title=None, file_name=None, timeout_sec=None):
     """EPUB 내부 컨테이너 구조 및 본문 파일 분석 후 ISBN 추출 (지능형 LLM 듀얼 분기 가동)"""
     try:
         with zipfile.ZipFile(epub_path, 'r') as epub:
@@ -264,7 +341,8 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
             if len(re.sub(r'\s', '', sample_epub_text)) < 20:
                 return None, None  # 이미지 전용책이므로 실시간 수색 종료
 
-            isbn10_candidates = []
+            isbn10_confident = []
+            isbn10_weak = []
             compiled_texts = []
 
             for idx in target_spines:
@@ -284,24 +362,18 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
                         if text_content.strip():
                             compiled_texts.append(text_content)
 
-                        found13, found10s = _scan_text_for_isbn(text_content)
+                        found13, found_conf, found_weak = _scan_text_for_isbn(text_content)
                         if found13:
                             return found13, "LOCAL"
-                        isbn10_candidates.extend(found10s)
+                        isbn10_confident.extend(found_conf)
+                        isbn10_weak.extend(found_weak)
                     except Exception:
                         pass
 
-            if isbn10_candidates:
-                return isbn10_candidates[0], "LOCAL"
-
-            if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
-                full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-                llm_isbn = extract_isbn_via_llm(
-                    full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
-                    book_title=book_title, file_name=file_name,
-                )
-                if llm_isbn:
-                    return llm_isbn, "AI"
+            return _finalize_isbn10(
+                compiled_texts, isbn10_confident, isbn10_weak,
+                gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name,
+            )
 
     except Exception:
         pass
@@ -309,10 +381,13 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
 
 
 def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_model=None,
-                           book_title=None, file_name=None):
+                           book_title=None, file_name=None, timeout_sec=None):
     """PDF 메타데이터 및 전후면 판권 페이지 고속 스캔 (지능형 LLM 듀얼 분기 가동)"""
     if not PYPDF_AVAILABLE:
-        return None, None
+        # 예전에는 여기서 조용히 (None, None)을 반환해 "ISBN을 찾지 못했습니다"라는
+        # 오해의 소지가 있는 일반 메시지로만 노출됐다. 원인을 명확히 알 수 있도록 예외로 전파한다.
+        # 호출부(extract_isbn.py의 search())가 이미 Exception을 잡아 메시지를 그대로 보여준다.
+        raise RuntimeError("pypdf 패키지가 설치되어 있지 않아 PDF를 읽을 수 없습니다. 'pip install pypdf'로 설치해 주세요.")
 
     try:
         with open(pdf_path, 'rb') as f:
@@ -343,7 +418,8 @@ def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_mode
                 pages_to_scan.extend(list(range(max(PDF_SCAN_PAGES, num_pages - PDF_SCAN_PAGES), num_pages)))
             pages_to_scan = sorted(list(set(pages_to_scan)))
 
-            isbn10_candidates = []
+            isbn10_confident = []
+            isbn10_weak = []
             compiled_texts = []
 
             for page_idx in pages_to_scan:
@@ -356,23 +432,19 @@ def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_mode
                 if text.strip():
                     compiled_texts.append(text)
 
-                found13, found10s = _scan_text_for_isbn(text)
+                found13, found_conf, found_weak = _scan_text_for_isbn(text)
                 if found13:
                     return found13, "LOCAL"
-                isbn10_candidates.extend(found10s)
+                isbn10_confident.extend(found_conf)
+                isbn10_weak.extend(found_weak)
 
-            if isbn10_candidates:
-                return isbn10_candidates[0], "LOCAL"
+            return _finalize_isbn10(
+                compiled_texts, isbn10_confident, isbn10_weak,
+                gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name,
+            )
 
-            if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
-                full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-                llm_isbn = extract_isbn_via_llm(
-                    full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
-                    book_title=book_title, file_name=file_name,
-                )
-                if llm_isbn:
-                    return llm_isbn, "AI"
-
+    except RuntimeError:
+        raise
     except Exception:
         pass
     return None, None
@@ -389,7 +461,7 @@ def _decode_bytes(raw, encoding_hints=('utf-8', 'cp949', 'euc-kr')):
 
 
 def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_model=None,
-                           book_title=None, file_name=None):
+                           book_title=None, file_name=None, timeout_sec=None):
     """TXT 파일 앞/뒤 구간을 스캔하여 ISBN 추출 (지능형 LLM 듀얼 분기 가동).
     판권지가 파일 맨 앞(표지 다음)이나 맨 뒤(colophon) 어디에 있어도 대응하도록
     파일의 앞쪽 TXT_SCAN_BYTES와 뒤쪽 TXT_SCAN_BYTES만 읽어 대용량 파일에서도 가볍게 동작합니다.
@@ -413,7 +485,8 @@ def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_mode
         if not front_text.strip() and not back_text.strip():
             return None, None
 
-        isbn10_candidates = []
+        isbn10_confident = []
+        isbn10_weak = []
         compiled_texts = []
 
         for text_content in (front_text, back_text):
@@ -422,22 +495,16 @@ def extract_isbn_from_txt(txt_path, gemini_key=None, llm_endpoint=None, llm_mode
             text_content = re.sub(r'[\u2012-\u2015\u00ad.]', '-', text_content)
             compiled_texts.append(text_content)
 
-            found13, found10s = _scan_text_for_isbn(text_content)
+            found13, found_conf, found_weak = _scan_text_for_isbn(text_content)
             if found13:
                 return found13, "LOCAL"
-            isbn10_candidates.extend(found10s)
+            isbn10_confident.extend(found_conf)
+            isbn10_weak.extend(found_weak)
 
-        if isbn10_candidates:
-            return isbn10_candidates[0], "LOCAL"
-
-        if (gemini_key or (llm_endpoint and llm_endpoint.strip())) and compiled_texts:
-            full_text = "\n".join(compiled_texts)[:LLM_TEXT_LIMIT]
-            llm_isbn = extract_isbn_via_llm(
-                full_text, gemini_key, endpoint=llm_endpoint, model=llm_model,
-                book_title=book_title, file_name=file_name,
-            )
-            if llm_isbn:
-                return llm_isbn, "AI"
+        return _finalize_isbn10(
+            compiled_texts, isbn10_confident, isbn10_weak,
+            gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name,
+        )
 
     except Exception:
         pass
