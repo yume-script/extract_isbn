@@ -247,8 +247,9 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
                 f'{logger.as_text()}'
             )
             return [{
-                # 설명란이 화면에 렌더링되지 않는 경우를 대비해 ISBN을 제목에도 그대로 노출한다.
-                'title': f'[ISBN: {existing_isbn}] {real_title}',
+                # 제목은 절대 건드리지 않는다 — "적용"을 눌렀을 때 실제로 바뀌는 건 isbn 컬럼뿐이어야 하고,
+                # 혹시 코어가 이 title 값을 별도 경로로 도서 제목에 반영하는 경우까지 대비해 원본 그대로 둔다.
+                'title': real_title,
                 'author': real_author,
                 'publisher': real_publisher,
                 'summary': cached_text,
@@ -316,8 +317,9 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
             f'{logger.as_text()}'
         )
         return [{
-            # 설명란이 화면에 렌더링되지 않는 경우를 대비해 ISBN을 제목에도 그대로 노출한다.
-            'title': f'[ISBN: {clean_isbn}] {real_title}',
+            # 제목은 절대 건드리지 않는다 — "적용"을 눌렀을 때 실제로 바뀌는 건 isbn 컬럼뿐이어야 하고,
+            # 혹시 코어가 이 title 값을 별도 경로로 도서 제목에 반영하는 경우까지 대비해 원본 그대로 둔다.
+            'title': real_title,
             'author': real_author,
             'publisher': real_publisher,
             'summary': result_text,
