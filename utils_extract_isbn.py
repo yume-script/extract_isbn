@@ -16,10 +16,10 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 try:
-    import pypdf
-    PYPDF_AVAILABLE = True
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
 except ImportError:
-    PYPDF_AVAILABLE = False
+    PYMUPDF_AVAILABLE = False
 
 
 ISBN_PATTERN = re.compile(
@@ -454,79 +454,85 @@ def extract_isbn_from_epub(epub_path, gemini_key=None, llm_endpoint=None, llm_mo
 def extract_isbn_from_pdf(pdf_path, gemini_key=None, llm_endpoint=None, llm_model=None,
                            book_title=None, file_name=None, timeout_sec=None, logger=None):
     """PDF 메타데이터 및 전후면 판권 페이지 고속 스캔 (지능형 LLM 듀얼 분기 가동)"""
-    if not PYPDF_AVAILABLE:
-        _log(logger, "pypdf 패키지 미설치 감지")
+    if not PYMUPDF_AVAILABLE:
+        _log(logger, "PyMuPDF(fitz) 패키지 미설치 감지")
         # 예전에는 여기서 조용히 (None, None)을 반환해 "ISBN을 찾지 못했습니다"라는
         # 오해의 소지가 있는 일반 메시지로만 노출됐다. 원인을 명확히 알 수 있도록 예외로 전파한다.
         # 호출부(extract_isbn.py의 search())가 이미 Exception을 잡아 메시지를 그대로 보여준다.
-        raise RuntimeError("pypdf 패키지가 설치되어 있지 않아 PDF를 읽을 수 없습니다. 'pip install pypdf'로 설치해 주세요.")
+        raise RuntimeError("PyMuPDF(fitz) 패키지가 설치되어 있지 않아 PDF를 읽을 수 없습니다. 'pip install pymupdf'로 설치해 주세요.")
 
     _log(logger, f"PDF 열기 시도: {os.path.basename(pdf_path)}")
+    doc = None
     try:
-        with open(pdf_path, 'rb') as f:
-            reader = pypdf.PdfReader(f)
-            num_pages = len(reader.pages)
-            if num_pages == 0:
-                _log(logger, "PDF 페이지 수가 0 — 처리 중단")
-                return None, None
-            _log(logger, f"총 페이지 수: {num_pages}")
+        doc = fitz.open(pdf_path)
+        num_pages = doc.page_count
+        if num_pages == 0:
+            _log(logger, "PDF 페이지 수가 0 — 처리 중단")
+            return None, None
+        _log(logger, f"총 페이지 수: {num_pages}")
 
-            # [초고속 조기 종료 필터]: 스캔본(통 이미지) 전용 PDF 판별
-            check_indices = list(range(1, min(6, num_pages)))
-            if num_pages > 5:
-                check_indices.extend(list(range(max(5, num_pages - 5), num_pages)))
-            check_indices = sorted(list(set(check_indices))) or [0]
+        # [초고속 조기 종료 필터]: 스캔본(통 이미지) 전용 PDF 판별
+        check_indices = list(range(1, min(6, num_pages)))
+        if num_pages > 5:
+            check_indices.extend(list(range(max(5, num_pages - 5), num_pages)))
+        check_indices = sorted(list(set(check_indices))) or [0]
 
-            sample_text = ""
-            for idx in check_indices:
-                try:
-                    p_text = reader.pages[idx].extract_text()
-                    if p_text:
-                        sample_text += p_text.strip()
-                except Exception:
-                    pass
-            if not sample_text.strip():
-                _log(logger, "표본 페이지에서 텍스트 추출 불가 — 스캔본(이미지 전용)으로 판단, 추출 중단")
-                return None, None  # 전후방 모두 글자가 전혀 긁히지 않는 스캔 도서
-            _log(logger, "텍스트 추출 가능한 PDF로 확인됨")
+        sample_text = ""
+        for idx in check_indices:
+            try:
+                p_text = doc[idx].get_text()
+                if p_text:
+                    sample_text += p_text.strip()
+            except Exception:
+                pass
+        if not sample_text.strip():
+            _log(logger, "표본 페이지에서 텍스트 추출 불가 — 스캔본(이미지 전용)으로 판단, 추출 중단")
+            return None, None  # 전후방 모두 글자가 전혀 긁히지 않는 스캔 도서
+        _log(logger, "텍스트 추출 가능한 PDF로 확인됨")
 
-            pages_to_scan = list(range(min(PDF_SCAN_PAGES, num_pages)))
-            if num_pages > PDF_SCAN_PAGES:
-                pages_to_scan.extend(list(range(max(PDF_SCAN_PAGES, num_pages - PDF_SCAN_PAGES), num_pages)))
-            pages_to_scan = sorted(list(set(pages_to_scan)))
-            _log(logger, f"앞/뒤 {PDF_SCAN_PAGES}페이지씩, 총 {len(pages_to_scan)}개 페이지 스캔 시작")
+        pages_to_scan = list(range(min(PDF_SCAN_PAGES, num_pages)))
+        if num_pages > PDF_SCAN_PAGES:
+            pages_to_scan.extend(list(range(max(PDF_SCAN_PAGES, num_pages - PDF_SCAN_PAGES), num_pages)))
+        pages_to_scan = sorted(list(set(pages_to_scan)))
+        _log(logger, f"앞/뒤 {PDF_SCAN_PAGES}페이지씩, 총 {len(pages_to_scan)}개 페이지 스캔 시작")
 
-            isbn10_confident = []
-            isbn10_weak = []
-            compiled_texts = []
+        isbn10_confident = []
+        isbn10_weak = []
+        compiled_texts = []
 
-            for page_idx in pages_to_scan:
-                text = reader.pages[page_idx].extract_text()
-                if not text:
-                    continue
+        for page_idx in pages_to_scan:
+            text = doc[page_idx].get_text()
+            if not text:
+                continue
 
-                text = re.sub(r'[\u2012-\u2015\u00ad.]', '-', text)
+            text = re.sub(r'[\u2012-\u2015\u00ad.]', '-', text)
 
-                if text.strip():
-                    compiled_texts.append(text)
+            if text.strip():
+                compiled_texts.append(text)
 
-                found13, found_conf, found_weak = _scan_text_for_isbn(text)
-                if found13:
-                    _log(logger, f"{page_idx + 1}페이지에서 ISBN13 즉시 발견: {found13} (LOCAL)")
-                    return found13, "LOCAL"
-                isbn10_confident.extend(found_conf)
-                isbn10_weak.extend(found_weak)
+            found13, found_conf, found_weak = _scan_text_for_isbn(text)
+            if found13:
+                _log(logger, f"{page_idx + 1}페이지에서 ISBN13 즉시 발견: {found13} (LOCAL)")
+                return found13, "LOCAL"
+            isbn10_confident.extend(found_conf)
+            isbn10_weak.extend(found_weak)
 
-            return _finalize_isbn10(
-                compiled_texts, isbn10_confident, isbn10_weak,
-                gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name,
-                logger=logger,
-            )
+        return _finalize_isbn10(
+            compiled_texts, isbn10_confident, isbn10_weak,
+            gemini_key, llm_endpoint, llm_model, timeout_sec, book_title, file_name,
+            logger=logger,
+        )
 
     except RuntimeError:
         raise
     except Exception as e:
         _log(logger, f"PDF 처리 중 예외 발생: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
     return None, None
 
 

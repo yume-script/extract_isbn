@@ -11,7 +11,7 @@ BookOasis 메타데이터 플러그인. EPUB / PDF / TXT 파일의 **앞부분�
 ## 설치
 
 1. 이 저장소의 파일 4개(`extract_isbn.py`, `utils_extract_isbn.py`, `__init__.py`, `VERSION`)를 BookOasis 서버의 `plugins/metadata/extract_isbn/` 폴더에 그대로 복사합니다.
-2. `pip install pypdf` (PDF 지원용 — 미설치 시 PDF 검색은 원인이 명시된 에러 메시지와 함께 실패합니다)
+2. `pip install pymupdf` (PDF 지원용 — 미설치 시 PDF 검색은 원인이 명시된 에러 메시지와 함께 실패합니다)
 3. 서버 재시작 후 환경설정 > 플러그인 설정에서 **ISBN 추출기**를 활성화합니다.
 
 ### 자동 업데이트
@@ -106,6 +106,7 @@ API 키/엔드포인트를 모두 비워두면 로컬 정규식 매칭만 사용
 
 ## 변경 이력
 
+- **1.3.0**: PDF 파싱 엔진을 `pypdf` → `PyMuPDF`(`fitz`)로 교체
 - **1.2.1**: 결과 카드 제목에 ISBN을 직접 노출(`[ISBN: ...] 제목`), `summary`/`description` 동시 채움 (코어가 읽는 설명 필드명이 불확실해 UI에 값이 안 보이던 문제 대응)
 - **1.2.0**: 단계별 처리 로그(`StepLogger`) 추가 — 서버 콘솔 + 결과 카드 노출
 - **1.1.0**: `raw_base_url` 실제 저장소 구조로 수정, 도서 매칭 신뢰도 경고, ISBN-10 문맥 기반 신뢰도 구분, `GEMINI_MODEL`/`REQUEST_TIMEOUT_SEC` 설정 추가, pypdf 미설치 에러 명시, 재추출 캐싱, ISBN 미보유 도서 대시보드 위젯
