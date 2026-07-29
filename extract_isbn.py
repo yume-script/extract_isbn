@@ -24,6 +24,7 @@ try:
         validate_isbn13,
         validate_isbn10,
         get_row_val,
+        StepLogger,
     )
 except ImportError:
     _utils_mod = _import_local_module("utils_extract_isbn")
@@ -33,6 +34,7 @@ except ImportError:
     validate_isbn13 = _utils_mod.validate_isbn13
     validate_isbn10 = _utils_mod.validate_isbn10
     get_row_val = _utils_mod.get_row_val
+    StepLogger = _utils_mod.StepLogger
 
 
 # 확장자 -> 추출 함수 매핑 (신규 포맷 대응 시 이 테이블만 확장하면 됨)
@@ -50,15 +52,17 @@ _METHOD_LABEL = {
 }
 
 
-def _fail_item(title, summary):
+def _fail_item(title, summary, log_text=""):
     """추출 실패/불가 상황을 검색 결과 카드 한 장으로 표현.
     _not_applicable 플래그로 apply() 단계에서 실수로 저장되지 않도록 막는다.
+    log_text가 주어지면 실패 사유 뒤에 단계별 로그를 그대로 덧붙여, 실패했을 때도
+    어느 단계에서 무슨 일이 있었는지 UI에서 바로 확인할 수 있게 한다.
     """
     return {
         'title': title,
         'author': '',
         'publisher': '',
-        'summary': summary,
+        'summary': f"{summary}{log_text}",
         'isbn': '',
         'cover': '',
         'pubDate': '',
@@ -113,7 +117,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         except Exception:
             return False
 
-    def _find_book(self, gateway, query):
+    def _find_book(self, gateway, query, logger=None):
         """검색창에 입력된 텍스트(보통 도서 제목)로 books 테이블에서 대상 도서를 추적.
 
         코어 계약상 search()는 book_id를 받지 못하므로 제목/파일명 기반으로 추정할 수밖에
@@ -123,6 +127,9 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         반환: (book, match_type) 또는 (None, None)
         match_type: 'exact_title' | 'file_path_like' | 'title_fuzzy'
         """
+        if logger:
+            logger.log(f'도서 매칭 시작 — 검색어: "{query}"')
+
         clean_query_base = re.sub(r'\.(epub|pdf|txt)$', '', query or '', flags=re.IGNORECASE)
         clean_query_base = re.sub(r'\[.*?\]|\(.*?\)', '', clean_query_base).strip()
         if not clean_query_base:
@@ -133,27 +140,41 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         has_isbn = self._has_isbn_column(gateway)
         select_cols = "file_path, title, author, publisher" + (", isbn" if has_isbn else "")
 
+        if logger:
+            logger.log(f'1단계: 제목 완전 일치 검색 시도 — "{clean_query_base}"')
         book = gateway.fetch_one(f"SELECT {select_cols} FROM books WHERE title = ? LIMIT 1", (clean_query_base,))
         if book:
+            if logger:
+                logger.log(f'제목 완전 일치로 도서 확정: "{get_row_val(book, "title")}"')
             return book, 'exact_title'
 
+        if logger:
+            logger.log("제목 완전 일치 실패 — 2단계: 파일 경로 부분 일치 검색 시도")
         book = gateway.fetch_one(
             f"SELECT {select_cols} FROM books WHERE file_path LIKE ? LIMIT 1",
             (f"%{clean_query_base}%",)
         )
         if book:
+            if logger:
+                logger.log(f'파일 경로 부분 일치로 도서 추정: "{get_row_val(book, "title")}" (신뢰도 낮음)')
             return book, 'file_path_like'
 
         words = [w for w in clean_query_base.split() if len(w) > 1]
         if len(words) >= 2:
             sub_query = " ".join(words[:2])
+            if logger:
+                logger.log(f'파일 경로 일치 실패 — 3단계: 제목 단어 조합 유사 검색 시도 ("{sub_query}")')
             book = gateway.fetch_one(
                 f"SELECT {select_cols} FROM books WHERE title LIKE ? LIMIT 1",
                 (f"%{sub_query}%",)
             )
             if book:
+                if logger:
+                    logger.log(f'단어 조합 유사 검색으로 도서 추정: "{get_row_val(book, "title")}" (신뢰도 낮음)')
                 return book, 'title_fuzzy'
 
+        if logger:
+            logger.log("모든 매칭 단계 실패 — 일치하는 도서 없음")
         return None, None
 
     # ------------------------------------------------------------------
@@ -161,15 +182,18 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
     # ------------------------------------------------------------------
 
     def search(self, db_type, query):
+        logger = StepLogger()
+
         if not query or not str(query).strip():
             return [_fail_item('❌ 검색어가 비어 있습니다', '도서 제목이나 파일명을 입력해 주세요.')]
 
         gateway = self.get_db_gateway(db_type)
-        book, match_type = self._find_book(gateway, query)
+        book, match_type = self._find_book(gateway, query, logger=logger)
         if not book:
             return [_fail_item(
                 '❌ 도서를 찾지 못했습니다',
-                f'"{query}"와 일치하는 도서를 라이브러리 DB에서 찾을 수 없습니다.'
+                f'"{query}"와 일치하는 도서를 라이브러리 DB에서 찾을 수 없습니다.',
+                log_text=logger.as_text(),
             )]
 
         file_path = get_row_val(book, 'file_path')
@@ -178,7 +202,13 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         real_publisher = get_row_val(book, 'publisher')
 
         if not file_path or not os.path.exists(file_path):
-            return [_fail_item('❌ 파일을 찾을 수 없습니다', '도서 레코드는 있으나 실제 파일 경로가 존재하지 않습니다.')]
+            logger.log(f"파일 경로 확인 실패: {file_path or '(경로 없음)'}")
+            return [_fail_item(
+                '❌ 파일을 찾을 수 없습니다',
+                '도서 레코드는 있으나 실제 파일 경로가 존재하지 않습니다.',
+                log_text=logger.as_text(),
+            )]
+        logger.log(f"대상 파일 확인됨: {file_path}")
 
         # 검색어와 완전히 같은 제목으로 찾은 게 아니라면(유사 매칭), 사용자가 지금 편집하려는
         # 책과 실제로 파일을 열어 추출하는 책이 다를 위험이 있다. 반드시 확인할 수 있도록
@@ -194,16 +224,20 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         ext = os.path.splitext(file_path)[1].lower()
         extractor = _EXTRACTORS.get(ext)
         if not extractor:
+            logger.log(f"지원하지 않는 확장자: {ext or '(없음)'}")
             return [_fail_item(
                 '❌ 지원하지 않는 파일 형식',
-                f'현재 EPUB/PDF/TXT만 지원합니다. (감지된 형식: {ext or "확장자 없음"})'
+                f'현재 EPUB/PDF/TXT만 지원합니다. (감지된 형식: {ext or "확장자 없음"})',
+                log_text=logger.as_text(),
             )]
+        logger.log(f"파일 형식 확인됨: {ext} — 해당 추출기로 진행")
 
         # 이미 유효한 ISBN이 저장되어 있다면, 굳이 파일을 다시 읽거나(특히 비용이 드는 AI 호출)
         # 재추출하지 않는다. 값을 다시 확인하고 싶다면 DB에서 값을 비운 뒤 재실행하면 된다.
         existing_isbn_raw = get_row_val(book, 'isbn')
         existing_isbn = re.sub(r'[^0-9X]', '', str(existing_isbn_raw or '').upper())
         if existing_isbn and (validate_isbn13(existing_isbn) or validate_isbn10(existing_isbn)):
+            logger.log(f"DB에 이미 유효한 ISBN 저장되어 있음 — 재추출 생략: {existing_isbn}")
             return [{
                 'title': real_title,
                 'author': real_author,
@@ -212,6 +246,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
                     f'{match_warning}'
                     f'ℹ️ 이미 유효한 ISBN이 저장되어 있어 재추출하지 않았습니다: {existing_isbn}\n'
                     f'다시 추출하려면 이 도서의 ISBN 값을 비운 뒤 재검색하세요.'
+                    f'{logger.as_text()}'
                 ),
                 'isbn': existing_isbn,
                 'cover': '',
@@ -228,6 +263,11 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
         except (TypeError, ValueError):
             timeout_sec = None
 
+        if gemini_key or llm_endpoint:
+            logger.log("AI 보조 판독 사용 가능 (설정된 API/엔드포인트 확인됨)")
+        else:
+            logger.log("AI 미설정 — 로컬 정규식 매칭 결과만 사용")
+
         try:
             extracted_isbn, method = extractor(
                 file_path,
@@ -237,19 +277,27 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
                 book_title=real_title or None,
                 file_name=os.path.basename(file_path),
                 timeout_sec=timeout_sec,
+                logger=logger,
             )
         except Exception as e:
-            return [_fail_item('❌ 추출 중 오류 발생', f'{match_warning}{str(e)}')]
+            logger.log(f"추출기 실행 중 예외 발생: {e}")
+            return [_fail_item('❌ 추출 중 오류 발생', f'{match_warning}{str(e)}', log_text=logger.as_text())]
 
         if not extracted_isbn:
             return [_fail_item(
                 '❌ ISBN을 찾지 못했습니다',
-                f'{match_warning}파일 내부(판권지/메타데이터)에서 유효한 ISBN 패턴을 발견하지 못했습니다.'
+                f'{match_warning}파일 내부(판권지/메타데이터)에서 유효한 ISBN 패턴을 발견하지 못했습니다.',
+                log_text=logger.as_text(),
             )]
 
         clean_isbn = re.sub(r'[^0-9X]', '', str(extracted_isbn).upper())
         if not (validate_isbn13(clean_isbn) or validate_isbn10(clean_isbn)):
-            return [_fail_item('❌ 유효하지 않은 ISBN', f'{match_warning}추출된 값이 체크디지트 검증을 통과하지 못했습니다: {clean_isbn}')]
+            logger.log(f"최종 검증 실패 — 체크디지트 불일치: {clean_isbn}")
+            return [_fail_item(
+                '❌ 유효하지 않은 ISBN',
+                f'{match_warning}추출된 값이 체크디지트 검증을 통과하지 못했습니다: {clean_isbn}',
+                log_text=logger.as_text(),
+            )]
 
         method_label = _METHOD_LABEL.get(method, method or '알 수 없음')
         confidence_note = ""
@@ -264,6 +312,7 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
                 f'{match_warning}'
                 f'✅ ISBN 추출 성공: {clean_isbn}  (감지 방식: {method_label}){confidence_note}\n'
                 f'※ 이 항목을 적용해도 제목/저자/출판사/표지/설명은 변경되지 않으며, ISBN만 갱신됩니다.'
+                f'{logger.as_text()}'
             ),
             'isbn': clean_isbn,
             'cover': '',
