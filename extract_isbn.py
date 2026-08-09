@@ -351,36 +351,36 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
     # 선택 계약: 대시보드 위젯 (ISBN 미보유 도서 목록)
     # ------------------------------------------------------------------
 
-    def get_dashboard_data(self, db_type, limit=10):
-        gateway = self.get_db_gateway(db_type)
+    #def get_dashboard_data(self, db_type, limit=10):
+    #    gateway = self.get_db_gateway(db_type)
 
-        if not self._has_isbn_column(gateway):
-            return {'success': False, 'error': "books 테이블에 'isbn' 컬럼이 없습니다."}
+    #    if not self._has_isbn_column(gateway):
+    #        return {'success': False, 'error': "books 테이블에 'isbn' 컬럼이 없습니다."}
 
-        config = self.get_plugin_config(db_type, default={})
-        try:
-            configured_limit = int(config.get("DASHBOARD_LIMIT") or 0) or limit
-        except (TypeError, ValueError):
-            configured_limit = limit
+    #    config = self.get_plugin_config(db_type, default={})
+    #    try:
+    #        configured_limit = int(config.get("DASHBOARD_LIMIT") or 0) or limit
+    #    except (TypeError, ValueError):
+    #        configured_limit = limit
 
-        try:
-            rows = gateway.fetch_all(
-                "SELECT id, title, author, file_path FROM books "
-                "WHERE COALESCE(is_deleted, 0) = 0 AND (isbn IS NULL OR isbn = '') "
-                "ORDER BY id DESC LIMIT ?",
-                (configured_limit,),
-            )
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+    #    try:
+    #        rows = gateway.fetch_all(
+    #            "SELECT id, title, author, file_path FROM books "
+    #            "WHERE COALESCE(is_deleted, 0) = 0 AND (isbn IS NULL OR isbn = '') "
+    #            "ORDER BY id DESC LIMIT ?",
+    #            (configured_limit,),
+    #        )
+    #    except Exception as e:
+    #        return {'success': False, 'error': str(e)}
 
-        items = []
-        for row in (rows or []):
-            file_path = get_row_val(row, 'file_path')
-            ext = os.path.splitext(file_path)[1].lower() if file_path else ''
-            items.append({
-                'title': get_row_val(row, 'title') or '(제목 없음)',
-                'subtitle': get_row_val(row, 'author') or '',
-                'meta': ext.lstrip('.').upper() if ext in _EXTRACTORS else f'미지원 형식({ext or "?"})',
-            })
+    #    items = []
+    #    for row in (rows or []):
+    #        file_path = get_row_val(row, 'file_path')
+    #        ext = os.path.splitext(file_path)[1].lower() if file_path else ''
+    #        items.append({
+    #            'title': get_row_val(row, 'title') or '(제목 없음)',
+    #            'subtitle': get_row_val(row, 'author') or '',
+    #            'meta': ext.lstrip('.').upper() if ext in _EXTRACTORS else f'미지원 형식({ext or "?"})',
+    #        })
 
         return {'success': True, 'items': items}
