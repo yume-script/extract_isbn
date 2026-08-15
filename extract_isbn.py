@@ -99,13 +99,13 @@ class ExtractIsbnMetadataProvider(BaseMetadataProvider):
          "type": "number", "required": False},
     ]
 
-    dashboard_widget = {
-        'title': 'ISBN 미보유 도서',
-        'subtitle': 'ISBN 값이 비어 있는 도서 목록',
-        'provider': 'ISBN 추출기',
-        'icon': 'fa-solid fa-barcode',
-        'limit': 10,
-    }
+    #dashboard_widget = {
+        #'title': 'ISBN 미보유 도서',
+        #'subtitle': 'ISBN 값이 비어 있는 도서 목록',
+        #'provider': 'ISBN 추출기',
+        #'icon': 'fa-solid fa-barcode',
+        #'limit': 10,
+    #}
 
     # ------------------------------------------------------------------
     # 내부 헬퍼
